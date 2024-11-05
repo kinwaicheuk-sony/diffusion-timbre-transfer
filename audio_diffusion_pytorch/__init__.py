@@ -9,6 +9,7 @@ from .diffusion import (
     KarrasSampler,
     KarrasSchedule,
     KarrasSamplerReverse,
+    KarrasSampler_grad_guided,
     KDiffusion,
     LinearSchedule,
     LogNormalDistribution,
@@ -45,5 +46,5 @@ from .modules import NumberEmbedder, T5Embedder, UNet1d, UNetConditional1d, EnCo
 # from .modules_eloi import UNet1d_eloi
 
 from .encodec_utils import NormalizedEncodec, z_denorm, z_norm
-from .pitch_tracking_utils import PitchTracker
+# from .pitch_tracking_utils import PitchTracker
 from .utils import plot_spec, play_audio

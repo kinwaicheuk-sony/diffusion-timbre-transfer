@@ -7,7 +7,8 @@ class NormalizedEncodec:
     def __init__(self, model_name: str = "facebook/encodec_24khz", device: str ='cuda'):
         self.device = device
         self.encodec_model = EncodecModel.from_pretrained(model_name).to(self.device)
-
+        # need gradient for guidance
+        self.encodec_model.train()
     def encode_latent(self, x: Tensor, mean: Optional[Tensor], std: Optional[Tensor]) -> Tensor:
         encoder = self.encodec_model.get_encoder()
         with torch.no_grad():
@@ -21,6 +22,13 @@ class NormalizedEncodec:
         if mean is not None and std is not None:
             z = z_denorm(z, mean, std)
         with torch.no_grad():
+            x = decoder(z)
+        return x
+    
+    def decode_latent_grad(self, z: Tensor, mean: Optional[Tensor], std: Optional[Tensor]) -> Tensor:
+        decoder = self.encodec_model.get_decoder()
+        if mean is not None and std is not None:
+            z = z_denorm(z, mean, std)
             x = decoder(z)
         return x
 
