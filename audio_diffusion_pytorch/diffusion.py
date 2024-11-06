@@ -764,14 +764,20 @@ class KarrasSampler_grad_guided(Sampler):
         # gradient guidance using control function f
         torch.set_grad_enabled(True)
         x_hat_in = x_hat.requires_grad_(True) # requires grad for the input
+        # chroma_pred = self.f(
+        #     self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
+        #     )
         chroma_pred = self.f(
-            self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
+            self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
             )
+        # plt.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+        # plt.show()
         chroma_cond = self.f(self.c)
         loss = torch.functional.F.mse_loss(chroma_pred, chroma_cond) # TODO: check if I need a negative here
         grad = torch.autograd.grad(loss, x_hat_in)[0]
-        grad = grad * 1 # TODO: check guidance strength other than 1
-        d = d + grad
+        grad = grad.detach() * 1 # TODO: check guidance strength other than 1
+        d = d + grad/torch.norm(grad)*torch.norm(d)
+
         # TODO: remember to normalize the gradient
 
         # Take euler step from sigma_hat to sigma_next
