@@ -749,6 +749,8 @@ class KarrasSampler_grad_guided(Sampler):
         self.s_noise = s_noise
         self.s_churn = s_churn
         self.bridge = bridge
+        self.counter = 0
+        self.loss_history = []
 
     def step(
         self, x: Tensor, fn: Callable, sigma: float, sigma_next: float, gamma: float
@@ -767,13 +769,25 @@ class KarrasSampler_grad_guided(Sampler):
         # chroma_pred = self.f(
         #     self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
         #     )
-        chroma_pred = self.f(
-            self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
-            )
-        # plt.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
-        # plt.show()
+        audio_pred = self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
+        chroma_pred = self.f(audio_pred)
         chroma_cond = self.f(self.c)
-        loss = torch.functional.F.mse_loss(chroma_pred, chroma_cond) # TODO: check if I need a negative here
+        loss = torch.functional.F.mse_loss( # loss for normalized chromagram
+            chroma_pred/chroma_pred.max(),
+            chroma_cond/chroma_cond.max()) # TODO: check if I need a negative here        
+        ### =====uncomment this part for debugging=====
+        fig, ax = plt.subplots()
+        im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+        plt.title(f'sigma: {sigma}')
+        plt.savefig(f"frames/step_{self.counter:04d}.png")
+        plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook
+        self.loss_history.append(loss.item())
+        torch.save(self.loss_history, f"frames/loss_history_{self.counter}.pt")
+        if self.counter == 0 or self.counter == 98 or self.counter == 49:
+            torch.save(audio_pred, f"frames/audio_pred_{self.counter}.pt")
+            torch.save(chroma_pred, f"frames/chroma_pred_{self.counter}.pt")
+        self.counter += 1
+        ### =====end of debugging block=====
         grad = torch.autograd.grad(loss, x_hat_in)[0]
         grad = grad.detach() * 1 # TODO: check guidance strength other than 1
         d = d + grad/torch.norm(grad)*torch.norm(d)
