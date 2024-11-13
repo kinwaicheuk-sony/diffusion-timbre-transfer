@@ -18,6 +18,7 @@ from functools import partial
 import torchaudio
 import matplotlib.pyplot as plt
 import librosa
+import os
 
 from .utils import default, exists
 
@@ -736,7 +737,9 @@ class KarrasSampler_grad_guided(Sampler):
         s_tmax: float = float("inf"),
         s_churn: float = 0.0,
         s_noise: float = 1.0,
+        alpha: float = 0.1,
         bridge: bool = True
+
     ):
         super().__init__()
         self.f = f
@@ -750,6 +753,136 @@ class KarrasSampler_grad_guided(Sampler):
         self.s_churn = s_churn
         self.bridge = bridge
         self.counter = 0
+        self.alpha = alpha
+        self.loss_history = []
+
+    def step(
+        self,
+        x: Tensor,
+        fn: Callable,
+        sigma: float,
+        sigma_next: float,
+        gamma: float,
+        index: int,
+        counter: int
+    ) -> Tensor:
+        """Algorithm 2 (step)"""
+        # Select temporarily increased noise level
+        sigma_hat = sigma + gamma * sigma
+        # Add noise to move from sigma to sigma_hat
+        epsilon = self.s_noise * torch.randn_like(x)
+        x_hat = x + sqrt(sigma_hat ** 2 - sigma ** 2) * epsilon
+        # Evaluate ∂x/∂sigma at sigma_hat
+        d = (x_hat - fn(x_hat, sigma=sigma_hat)) / sigma_hat
+        # gradient guidance using control function f
+        torch.set_grad_enabled(True)
+        x_hat_in = x_hat.requires_grad_(True) # requires grad for the input
+        # chroma_pred = self.f(
+        #     self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
+        #     )
+        audio_pred = self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
+        chroma_pred = self.f(audio_pred)
+        chroma_cond = self.f(self.c)
+        loss = torch.functional.F.mse_loss( # loss for normalized chromagram
+            chroma_pred/chroma_pred.max(),
+            chroma_cond/chroma_cond.max()) # TODO: check if I need a negative here        
+        ### =====uncomment this part for debugging=====
+        # check if output folder exists
+        output_folder = f"frames/alpha_exp/{self.alpha}"
+        os.makedirs(output_folder, exist_ok=True)
+        self.loss_history.append(loss.item())
+        if counter == 49 or counter == 98:
+            # plot chromagrams
+            fig, ax = plt.subplots()
+            im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+            plt.title(f'sigma: {sigma}')            
+            plt.savefig(f"{output_folder}/{index:02d}_step_{counter:04d}.png")
+            plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook            
+            # save predictions
+            torch.save(audio_pred, f"{output_folder}/{index:02d}_audio_pred_{counter}.pt")
+            torch.save(chroma_pred, f"{output_folder}/{index:02d}_chroma_pred_{counter}.pt")
+            # save loss curve
+            if counter == 98:
+                 torch.save(self.loss_history, f"{output_folder}/{index:02d}_loss_history_{counter}.pt")
+        ### =====end of debugging block=====
+        grad = torch.autograd.grad(loss, x_hat_in)[0] # grad will have the same shape as x_hat_in
+        grad = grad.detach() * 1 # TODO: check guidance strength other than 1
+        d = self.alpha*d + (1-self.alpha)*grad/torch.norm(grad)*torch.norm(d)
+       
+        # TODO: remember to normalize the gradient
+
+        # Take euler step from sigma_hat to sigma_next
+        x_next = x_hat + (sigma_next - sigma_hat) * d
+        # Second order correction
+        if sigma_next != 0:
+            model_out_next = fn(x_next, sigma=sigma_next)
+            d_prime = (x_next - model_out_next) / sigma_next
+            # gradient guidance using control function f
+            # TODO
+            x_next = x_hat + 0.5 * (sigma_next - sigma_hat) * (d + d_prime)
+        return x_next
+
+    def forward(
+        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int, index: int
+    ) -> Tensor:
+    
+        if self.bridge:
+            x = noise
+        elif not self.bridge:
+            x = sigmas[0] * noise 
+        else:
+            print("Select if you want to performe schrodinger bridge or not") 
+
+        self.s_churn = 0
+        # Compute gammas
+        gammas = torch.where(
+            (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax),
+            min(self.s_churn / num_steps, sqrt(2) - 1),
+            0.0,
+        )
+        # Denoise to sample
+        for i in range(num_steps - 1):
+            #file_path = f"/home/demancum/Samples/x_test.wav"
+            #torchaudio.save(file_path, x[0].cpu(), 16000)
+            x = self.step(
+                x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1], gamma=gammas[i], index=index, counter=i  # type: ignore # noqa
+            )
+            #print("std of x", x.std().item()) #check std of the sample at each step should be similar to sigma (only for big sigmas)
+            #print("sigmas  ", sigmas[i].item())
+
+
+        return x
+    
+
+class KarrasSampler_grad_guidedv2(Sampler):
+    """https://arxiv.org/abs/2206.00364 algorithm 1"""
+
+    diffusion_types = [KDiffusion, VKDiffusion]
+
+    def __init__(
+        self,
+        f: nn.Module,
+        c: torch.Tensor,
+        encodec: nn.Module,
+        mean: float,
+        std: float,
+        s_tmin: float = 0,
+        s_tmax: float = float("inf"),
+        s_churn: float = 0.0,
+        s_noise: float = 1.0,
+        bridge: bool = True
+    ):
+        super().__init__()
+        self.f = f
+        self.c = c
+        self.mean = mean
+        self.std = std
+        self.encodec = encodec
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
+        self.s_churn = s_churn
+        self.bridge = bridge
         self.loss_history = []
 
     def step(
@@ -776,21 +909,21 @@ class KarrasSampler_grad_guided(Sampler):
             chroma_pred/chroma_pred.max(),
             chroma_cond/chroma_cond.max()) # TODO: check if I need a negative here        
         ### =====uncomment this part for debugging=====
-        fig, ax = plt.subplots()
-        im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
-        plt.title(f'sigma: {sigma}')
-        plt.savefig(f"frames/step_{self.counter:04d}.png")
-        plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook
-        self.loss_history.append(loss.item())
-        torch.save(self.loss_history, f"frames/loss_history_{self.counter}.pt")
-        if self.counter == 0 or self.counter == 98 or self.counter == 49:
-            torch.save(audio_pred, f"frames/audio_pred_{self.counter}.pt")
-            torch.save(chroma_pred, f"frames/chroma_pred_{self.counter}.pt")
-        self.counter += 1
+        # fig, ax = plt.subplots()
+        # im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+        # plt.title(f'sigma: {sigma}')
+        # plt.savefig(f"frames/step_{self.counter:04d}.png")
+        # plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook
+        # self.loss_history.append(loss.item())
+        # torch.save(self.loss_history, f"frames/loss_history_{self.counter}.pt")
+        # if self.counter == 0 or self.counter == 98 or self.counter == 49:
+        #     torch.save(audio_pred, f"frames/audio_pred_{self.counter}.pt")
+        #     torch.save(chroma_pred, f"frames/chroma_pred_{self.counter}.pt")
+        # self.counter += 1
         ### =====end of debugging block=====
         grad = torch.autograd.grad(loss, x_hat_in)[0]
-        grad = grad.detach() * 1 # TODO: check guidance strength other than 1
-        d = d + grad/torch.norm(grad)*torch.norm(d)
+        grad = grad.detach() * 1 / torch.norm(grad) # normalize the gradient
+        # grad = grad * 
 
         # TODO: remember to normalize the gradient
 
@@ -1097,7 +1230,7 @@ class DiffusionSampler(nn.Module):
         # Append additional kwargs to denoise function (used e.g. for conditional unet)
         fn = lambda *a, **ka: self.denoise_fn(*a, **{**ka, **kwargs})  # noqa
         # Sample using sampler
-        x = self.sampler(noise, fn=fn, sigmas=sigmas, num_steps=num_steps)
+        x = self.sampler(noise, fn=fn, sigmas=sigmas, num_steps=num_steps, **kwargs)
         x = x.clamp(-1.0, 1.0) if self.clamp else x 
         return x
 

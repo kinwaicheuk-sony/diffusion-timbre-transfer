@@ -10,6 +10,7 @@ from .diffusion import (
     KarrasSchedule,
     KarrasSamplerReverse,
     KarrasSampler_grad_guided,
+    KarrasSampler_grad_guidedv2,
     KDiffusion,
     LinearSchedule,
     LogNormalDistribution,
