@@ -790,6 +790,8 @@ class KarrasSampler_grad_guided(Sampler):
         # check if output folder exists
         output_folder = f"frames/alpha_exp/{self.alpha}"
         os.makedirs(output_folder, exist_ok=True)
+        if counter == 0:
+            self.loss_history = [] # reset loss history
         self.loss_history.append(loss.item())
         if counter == 49 or counter == 98:
             # plot chromagrams
