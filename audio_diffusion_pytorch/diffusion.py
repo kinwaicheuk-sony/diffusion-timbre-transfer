@@ -661,7 +661,8 @@ class KarrasSampler(Sampler):
         s_tmax: float = float("inf"),
         s_churn: float = 0.0,
         s_noise: float = 1.0,
-        bridge: bool = True
+        bridge: bool = True,
+        index: int = 0
     ):
         super().__init__()
         self.s_tmin = s_tmin
@@ -681,6 +682,8 @@ class KarrasSampler(Sampler):
         x_hat = x + sqrt(sigma_hat ** 2 - sigma ** 2) * epsilon
         # Evaluate ∂x/∂sigma at sigma_hat
         d = (x_hat - fn(x_hat, sigma=sigma_hat)) / sigma_hat
+        d = d
+
         # Take euler step from sigma_hat to sigma_next
         x_next = x_hat + (sigma_next - sigma_hat) * d
         # Second order correction
@@ -691,7 +694,7 @@ class KarrasSampler(Sampler):
         return x_next
 
     def forward(
-        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int
+        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int, index: int
     ) -> Tensor:
 
         if self.bridge:
@@ -738,7 +741,8 @@ class KarrasSampler_grad_guided(Sampler):
         s_churn: float = 0.0,
         s_noise: float = 1.0,
         alpha: float = 0.1,
-        bridge: bool = True
+        bridge: bool = True,
+        tag: str = "xxx"
 
     ):
         super().__init__()
@@ -755,6 +759,7 @@ class KarrasSampler_grad_guided(Sampler):
         self.counter = 0
         self.alpha = alpha
         self.loss_history = []
+        self.tag = tag
 
     def step(
         self,
@@ -788,7 +793,7 @@ class KarrasSampler_grad_guided(Sampler):
             chroma_cond/chroma_cond.max()) # TODO: check if I need a negative here        
         ### =====uncomment this part for debugging=====
         # check if output folder exists
-        output_folder = f"frames/alpha_exp/{self.alpha}"
+        output_folder = f"results/alpha_exp/{self.tag}/{self.alpha}"
         os.makedirs(output_folder, exist_ok=True)
         if counter == 0:
             self.loss_history = [] # reset loss history
@@ -809,7 +814,439 @@ class KarrasSampler_grad_guided(Sampler):
         ### =====end of debugging block=====
         grad = torch.autograd.grad(loss, x_hat_in)[0] # grad will have the same shape as x_hat_in
         grad = grad.detach() * 1 # TODO: check guidance strength other than 1
-        d = self.alpha*d + (1-self.alpha)*grad/torch.norm(grad)*torch.norm(d)
+        d = (d + self.alpha*grad/torch.norm(grad)*torch.norm(d))
+       
+        # TODO: remember to normalize the gradient
+
+        # Take euler step from sigma_hat to sigma_next
+        x_next = x_hat + (sigma_next - sigma_hat) * d
+        # Second order correction
+        if sigma_next != 0:
+            model_out_next = fn(x_next, sigma=sigma_next)
+            d_prime = (x_next - model_out_next) / sigma_next
+            # gradient guidance using control function f
+            # TODO
+            x_next = x_hat + 0.5 * (sigma_next - sigma_hat) * (d + d_prime)
+        return x_next
+
+    def forward(
+        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int, index: int
+    ) -> Tensor:
+    
+        if self.bridge:
+            x = noise
+        elif not self.bridge:
+            x = sigmas[0] * noise 
+        else:
+            print("Select if you want to performe schrodinger bridge or not") 
+
+        self.s_churn = 0
+        # Compute gammas
+        gammas = torch.where(
+            (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax),
+            min(self.s_churn / num_steps, sqrt(2) - 1),
+            0.0,
+        )
+        # Denoise to sample
+        for i in range(num_steps - 1):
+            #file_path = f"/home/demancum/Samples/x_test.wav"
+            #torchaudio.save(file_path, x[0].cpu(), 16000)
+            x = self.step(
+                x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1], gamma=gammas[i], index=index, counter=i  # type: ignore # noqa
+            )
+            #print("std of x", x.std().item()) #check std of the sample at each step should be similar to sigma (only for big sigmas)
+            #print("sigmas  ", sigmas[i].item())
+
+
+        return x
+    
+class KarrasSampler_grad_guided_binary(Sampler):
+    """https://arxiv.org/abs/2206.00364 algorithm 1"""
+
+    diffusion_types = [KDiffusion, VKDiffusion]
+
+    def __init__(
+        self,
+        f: nn.Module,
+        c: torch.Tensor,
+        encodec: nn.Module,
+        mean: float,
+        std: float,
+        s_tmin: float = 0,
+        s_tmax: float = float("inf"),
+        s_churn: float = 0.0,
+        s_noise: float = 1.0,
+        loss_type: str = 'mse',
+        bridge: bool = True
+
+    ):
+        super().__init__()
+        self.f = f
+        self.c = c
+        self.mean = mean
+        self.std = std
+        self.encodec = encodec
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
+        self.s_churn = s_churn
+        self.bridge = bridge
+        self.counter = 0
+        self.loss_type = loss_type
+        self.loss_history = []
+
+    def step(
+        self,
+        x: Tensor,
+        fn: Callable,
+        sigma: float,
+        sigma_next: float,
+        gamma: float,
+        index: int,
+        counter: int
+    ) -> Tensor:
+        """Algorithm 2 (step)"""
+        # Select temporarily increased noise level
+        sigma_hat = sigma + gamma * sigma
+        # Add noise to move from sigma to sigma_hat
+        epsilon = self.s_noise * torch.randn_like(x)
+        x_hat = x + sqrt(sigma_hat ** 2 - sigma ** 2) * epsilon
+        # Evaluate ∂x/∂sigma at sigma_hat
+        d = (x_hat - fn(x_hat, sigma=sigma_hat)) / sigma_hat
+        # gradient guidance using control function f
+        torch.set_grad_enabled(True)
+        x_hat_in = x_hat.requires_grad_(True) # requires grad for the input
+        # chroma_pred = self.f(
+        #     self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
+        #     )
+        audio_pred = self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
+        chroma_pred = self.f(audio_pred)
+        chroma_cond = self.f(self.c)
+        binary_cond = (chroma_cond/chroma_cond.max()>0.1).float()
+        if self.loss_type == 'mse':
+            loss = torch.functional.F.mse_loss( # loss for normalized chromagram
+                chroma_pred/chroma_pred.max(),
+                binary_cond) # TODO: check if I need a negative here
+        elif self.loss_type == 'bce':
+            loss = torch.functional.F.binary_cross_entropy( # loss for normalized chromagram
+                chroma_pred/chroma_pred.max(),
+                binary_cond)    
+        ### =====uncomment this part for debugging=====
+        # check if output folder exists
+        output_folder = f"results/binary/{self.loss_type}"
+        os.makedirs(output_folder, exist_ok=True)
+        if counter == 0:
+            self.loss_history = [] # reset loss history
+        self.loss_history.append(loss.item())
+        if counter == 49 or counter == 98:
+            # plot chromagrams
+            fig, ax = plt.subplots()
+            im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+            plt.title(f'sigma: {sigma}')            
+            plt.savefig(f"{output_folder}/{index:02d}_step_{counter:04d}.png")
+            plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook            
+            # save predictions
+            torch.save(audio_pred, f"{output_folder}/{index:02d}_audio_pred_{counter}.pt")
+            torch.save(chroma_pred, f"{output_folder}/{index:02d}_chroma_pred_{counter}.pt")
+            # save loss curve
+            if counter == 98:
+                 torch.save(self.loss_history, f"{output_folder}/{index:02d}_loss_history_{counter}.pt")
+        ### =====end of debugging block=====
+        grad = torch.autograd.grad(loss, x_hat_in)[0] # grad will have the same shape as x_hat_in
+        grad = grad.detach() * 1 # TODO: check guidance strength other than 1
+        d = d + grad/torch.norm(grad)*torch.norm(d)
+       
+        # TODO: remember to normalize the gradient
+
+        # Take euler step from sigma_hat to sigma_next
+        x_next = x_hat + (sigma_next - sigma_hat) * d
+        # Second order correction
+        if sigma_next != 0:
+            model_out_next = fn(x_next, sigma=sigma_next)
+            d_prime = (x_next - model_out_next) / sigma_next
+            # gradient guidance using control function f
+            # TODO
+            x_next = x_hat + 0.5 * (sigma_next - sigma_hat) * (d + d_prime)
+        return x_next
+
+    def forward(
+        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int, index: int
+    ) -> Tensor:
+    
+        if self.bridge:
+            x = noise
+        elif not self.bridge:
+            x = sigmas[0] * noise 
+        else:
+            print("Select if you want to performe schrodinger bridge or not") 
+
+        self.s_churn = 0
+        # Compute gammas
+        gammas = torch.where(
+            (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax),
+            min(self.s_churn / num_steps, sqrt(2) - 1),
+            0.0,
+        )
+        # Denoise to sample
+        for i in range(num_steps - 1):
+            #file_path = f"/home/demancum/Samples/x_test.wav"
+            #torchaudio.save(file_path, x[0].cpu(), 16000)
+            x = self.step(
+                x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1], gamma=gammas[i], index=index, counter=i  # type: ignore # noqa
+            )
+            #print("std of x", x.std().item()) #check std of the sample at each step should be similar to sigma (only for big sigmas)
+            #print("sigmas  ", sigmas[i].item())
+
+
+        return x
+    
+class KarrasSampler_grad_guided_fixed_binary_pitch(Sampler):
+    """https://arxiv.org/abs/2206.00364 algorithm 1"""
+
+    diffusion_types = [KDiffusion, VKDiffusion]
+
+    def __init__(
+        self,
+        f: nn.Module,
+        c: torch.Tensor,
+        encodec: nn.Module,
+        mean: float,
+        std: float,
+        s_tmin: float = 0,
+        s_tmax: float = float("inf"),
+        s_churn: float = 0.0,
+        s_noise: float = 1.0,
+        loss_type: str = 'mse',
+        bridge: bool = True
+
+    ):
+        super().__init__()
+        self.f = f
+        self.c = c
+        self.mean = mean
+        self.std = std
+        self.encodec = encodec
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
+        self.s_churn = s_churn
+        self.bridge = bridge
+        self.counter = 0
+        self.loss_type = loss_type
+        self.loss_history = []
+
+    def step(
+        self,
+        x: Tensor,
+        fn: Callable,
+        sigma: float,
+        sigma_next: float,
+        gamma: float,
+        index: int,
+        counter: int
+    ) -> Tensor:
+        """Algorithm 2 (step)"""
+        # Select temporarily increased noise level
+        sigma_hat = sigma + gamma * sigma
+        # Add noise to move from sigma to sigma_hat
+        epsilon = self.s_noise * torch.randn_like(x)
+        x_hat = x + sqrt(sigma_hat ** 2 - sigma ** 2) * epsilon
+        # Evaluate ∂x/∂sigma at sigma_hat
+        d = (x_hat - fn(x_hat, sigma=sigma_hat)) / sigma_hat
+        # gradient guidance using control function f
+        torch.set_grad_enabled(True)
+        x_hat_in = x_hat.requires_grad_(True) # requires grad for the input
+        # chroma_pred = self.f(
+        #     self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
+        #     )
+        audio_pred = self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
+        chroma_pred = self.f(audio_pred)
+        # chroma_cond = self.f(self.c)
+        # hard coded a major scale
+        chroma_cond = torch.zeros(1,1,12,401)
+        chroma_cond[0,0,0,0:40] = 1 # C
+        chroma_cond[0,0,2,40:80] = 1 # D
+        chroma_cond[0,0,4,80:120] = 1 # E
+        chroma_cond[0,0,5,120:160] = 1 # F
+        chroma_cond[0,0,7,160:200] = 1 # G
+        chroma_cond[0,0,9,200:240] = 1 # A
+        chroma_cond[0,0,11,240:280] = 1 # B
+        chroma_cond[0,0,0,280:400] = 1 # C
+
+        binary_cond = chroma_cond.to(chroma_pred.device)
+        if self.loss_type == 'mse':
+            loss = torch.functional.F.mse_loss( # loss for normalized chromagram
+                chroma_pred/chroma_pred.max(),
+                binary_cond) # TODO: check if I need a negative here
+        elif self.loss_type == 'bce':
+            loss = torch.functional.F.binary_cross_entropy( # loss for normalized chromagram
+                chroma_pred/chroma_pred.max(),
+                binary_cond)    
+        ### =====uncomment this part for debugging=====
+        # check if output folder exists
+        output_folder = f"results/binary_major_scale/{self.loss_type}"
+        os.makedirs(output_folder, exist_ok=True)
+        if counter == 0:
+            self.loss_history = [] # reset loss history
+        self.loss_history.append(loss.item())
+        if counter == 49 or counter == 98:
+            # plot chromagrams
+            fig, ax = plt.subplots()
+            im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+            plt.title(f'sigma: {sigma}')            
+            plt.savefig(f"{output_folder}/{index:02d}_step_{counter:04d}.png")
+            plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook            
+            # save predictions
+            torch.save(audio_pred, f"{output_folder}/{index:02d}_audio_pred_{counter}.pt")
+            torch.save(chroma_pred, f"{output_folder}/{index:02d}_chroma_pred_{counter}.pt")
+            # save loss curve
+            if counter == 98:
+                 torch.save(self.loss_history, f"{output_folder}/{index:02d}_loss_history_{counter}.pt")
+        ### =====end of debugging block=====
+        grad = torch.autograd.grad(loss, x_hat_in)[0] # grad will have the same shape as x_hat_in
+        grad = grad.detach() * 1 # TODO: check guidance strength other than 1
+        d = d + grad/torch.norm(grad)*torch.norm(d)
+       
+        # TODO: remember to normalize the gradient
+
+        # Take euler step from sigma_hat to sigma_next
+        x_next = x_hat + (sigma_next - sigma_hat) * d
+        # Second order correction
+        if sigma_next != 0:
+            model_out_next = fn(x_next, sigma=sigma_next)
+            d_prime = (x_next - model_out_next) / sigma_next
+            # gradient guidance using control function f
+            # TODO
+            x_next = x_hat + 0.5 * (sigma_next - sigma_hat) * (d + d_prime)
+        return x_next
+
+    def forward(
+        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int, index: int
+    ) -> Tensor:
+    
+        if self.bridge:
+            x = noise
+        elif not self.bridge:
+            x = sigmas[0] * noise 
+        else:
+            print("Select if you want to performe schrodinger bridge or not") 
+
+        self.s_churn = 0
+        # Compute gammas
+        gammas = torch.where(
+            (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax),
+            min(self.s_churn / num_steps, sqrt(2) - 1),
+            0.0,
+        )
+        # Denoise to sample
+        for i in range(num_steps - 1):
+            #file_path = f"/home/demancum/Samples/x_test.wav"
+            #torchaudio.save(file_path, x[0].cpu(), 16000)
+            x = self.step(
+                x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1], gamma=gammas[i], index=index, counter=i  # type: ignore # noqa
+            )
+            #print("std of x", x.std().item()) #check std of the sample at each step should be similar to sigma (only for big sigmas)
+            #print("sigmas  ", sigmas[i].item())
+
+
+        return x
+    
+class KarrasSampler_grad_guided_alpha_schedule(Sampler):
+    """https://arxiv.org/abs/2206.00364 algorithm 1"""
+
+    diffusion_types = [KDiffusion, VKDiffusion]
+
+    def __init__(
+        self,
+        f: nn.Module,
+        c: torch.Tensor,
+        encodec: nn.Module,
+        mean: float,
+        std: float,
+        s_tmin: float = 0,
+        s_tmax: float = float("inf"),
+        s_churn: float = 0.0,
+        s_noise: float = 1.0,
+        alpha: float = 0.1,
+        alpha_schedule: str = "increase",
+        tag: str = "xxx",
+        bridge: bool = True
+
+    ):
+        super().__init__()
+        self.f = f
+        self.c = c
+        self.mean = mean
+        self.std = std
+        self.encodec = encodec
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
+        self.s_churn = s_churn
+        self.bridge = bridge
+        self.counter = 0
+        self.alpha = alpha
+        self.alpha_schedule = alpha_schedule
+        # check if alpha is a torch tensor
+        assert isinstance(self.alpha, torch.Tensor), "Alpha should be a torch tensor"
+        self.loss_history = []
+        self.tag = tag
+
+    def step(
+        self,
+        x: Tensor,
+        fn: Callable,
+        sigma: float,
+        sigma_next: float,
+        gamma: float,
+        index: int,
+        counter: int
+    ) -> Tensor:
+        """Algorithm 2 (step)"""
+        # Select temporarily increased noise level
+        sigma_hat = sigma + gamma * sigma
+        # Add noise to move from sigma to sigma_hat
+        epsilon = self.s_noise * torch.randn_like(x)
+        x_hat = x + sqrt(sigma_hat ** 2 - sigma ** 2) * epsilon
+        # Evaluate ∂x/∂sigma at sigma_hat
+        d = (x_hat - fn(x_hat, sigma=sigma_hat)) / sigma_hat
+        # gradient guidance using control function f
+        torch.set_grad_enabled(True)
+        x_hat_in = x_hat.requires_grad_(True) # requires grad for the input
+        # chroma_pred = self.f(
+        #     self.encodec.decode_latent_grad(x_hat_in, self.mean, self.std)
+        #     )
+        audio_pred = self.encodec.decode_latent_grad(fn(x_hat, sigma=sigma_hat), self.mean, self.std)
+        chroma_pred = self.f(audio_pred)
+        chroma_cond = self.f(self.c)
+        loss = torch.functional.F.mse_loss( # loss for normalized chromagram
+            chroma_pred/chroma_pred.max(),
+            chroma_cond/chroma_cond.max()) # TODO: check if I need a negative here        
+        ### =====uncomment this part for debugging=====
+        # check if output folder exists
+        output_folder = f"results/alpha_exp/{self.tag}/{self.alpha_schedule}"
+        os.makedirs(output_folder, exist_ok=True)
+        if counter == 0:
+            self.loss_history = [] # reset loss history
+        self.loss_history.append(loss.item())
+        if counter == 49 or counter == 98:
+            # plot chromagrams
+            fig, ax = plt.subplots()
+            im = ax.imshow(chroma_pred[0,0].detach().cpu().numpy(), origin='lower', aspect='auto')
+            plt.title(f'sigma: {sigma}')            
+            plt.savefig(f"{output_folder}/{index:02d}_step_{counter:04d}.png")
+            plt.close(fig)  # Close the figure to prevent it from displaying in Jupyter Notebook            
+            # save predictions
+            torch.save(audio_pred, f"{output_folder}/{index:02d}_audio_pred_{counter}.pt")
+            torch.save(chroma_pred, f"{output_folder}/{index:02d}_chroma_pred_{counter}.pt")
+            # save loss curve
+            if counter == 98:
+                 torch.save(self.loss_history, f"{output_folder}/{index:02d}_loss_history_{counter}.pt")
+        ### =====end of debugging block=====
+        grad = torch.autograd.grad(loss, x_hat_in)[0] # grad will have the same shape as x_hat_in
+        grad = grad.detach() * 1 # TODO: check guidance strength other than 1
+        d = d + self.alpha[counter]*grad/torch.norm(grad)*torch.norm(d)
+        # print(f"counter: {counter}\talpha: {self.alpha[counter]}")
        
         # TODO: remember to normalize the gradient
 
